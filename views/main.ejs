@@ -1,0 +1,510 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <meta charset="utf-8">
+    <title>nhk drama totalling</title>
+    <script src="jquery-3.6.0.min.js"></script>
+    <script src="jquery.columns.min.js"></script>
+    <script>
+        const DATENHKHASHTAG = new Date("<%= Setting.dateNhkHashTag %>");
+        const REGEXPCATEGORY = new RegExp("<%= Setting.regExpCategory %>", "g");
+        const REGEXPSYMBOL = new RegExp("<%= Setting.regExpSymbol %>", "g");
+
+        /**
+         * チェック状態
+         * 配列分はリスト、連想配列分は"<%= AppConst.MT %>"、"<%= AppConst.RT %>"、"<%= AppConst.FOLLOW %>"。
+         * 連想配列分はリセット手段が共通のため、"<%= AppConst.MT %>"にだけリセットがある。
+         * 下記のプロパティは全ての要素に常にあるわけではない。
+         * @property {string}  unread - 0～9(未読数)、*(未読数が9を超える)、制御値
+         * @property {string}  lastReadTweetId - 最新既読tweetId
+         * @property {string}  tweetIdNext - 最新未読tweetId　→　使わなくなったが使えるように残す(未読オーバーするとチェックしなくなるため未読最新でなくなってしまう)
+         * @property {string}  overview - 最新未読tweetText　→　tweetIdNext関連であまりあてにならない
+         * @property {string}  reset - 未読リセット要求
+         * @property {string}  lastFollowerId - 最新フォロワーID
+         */
+        var Target;
+
+        /**
+         * ターゲットタイプの配列
+         * 順、アクセス制限値等。
+         * 各要素の下記のプロパティは全ての要素に常にあるわけではない。
+         * @property {string}  type - "<%= AppConst.LIST %>"か"<%= AppConst.MT %>"か""<%= AppConst.RT %>"か"<%= AppConst.FOLLOW %>"
+         * @property {string}  limit - アクセス制限値(何秒の1回がセーフペースか)
+         * @property {string}  lastCheckTime - 前回のチェック時間
+         * @property {string}  index - "<%= AppConst.LIST %>"の場合に次にチェックするターゲット
+         */
+        var TargetType;
+
+        /**
+         * デバッグモード
+         * クライアントでデバッグしやすくするため
+         * @static
+         */
+        var Debug;
+
+        /**
+         * タイトル内の"<%= AppConst.MT %>"、"<%= AppConst.RT %>"、"<%= AppConst.FOLLOW %>"の位置
+         * @static
+         */
+        var NotificationsOrder;
+
+        var user = [];
+        var totalling = [];
+
+        /**
+         * デバッグ動作ラッパー(値用)
+         * @constructor
+         * @param {string} str デバッグ出力文字列
+         */
+        function DEBUGForValue(header, content)
+        {
+            //デバッグモードか
+            if (Debug == "<%= AppConst.ON %>")
+            {
+                console.debug("[DEBUG]" + header + ": " + content);
+            }
+
+            return;
+        }
+
+        /**
+         * デバッグ動作ラッパー(メッセージ用)
+         * @constructor
+         * @param {string} str デバッグ出力文字列
+         */
+        function DEBUGForMessage(message)
+        {
+            //デバッグモードか
+            if (Debug == "<%= AppConst.ON %>")
+            {
+                console.debug("[DEBUG]" + message);
+            }
+
+            return;
+        }
+
+        /**
+         * 致命的エラーで終了
+         * エラー情報を出力して終了する。
+         * (throwでお試し)
+         * @constructor
+         * @param {string} func 関数名
+         * @param {object} errorInfo エラー情報
+         */
+        function fatal(func, errorInfo)
+        {
+            console.error("function: " + func);
+            console.error(errorInfo);
+            throw arguments.callee.name;
+        }
+
+        /**
+         * ajaxのクエリを作成する。
+         * 要素の増減等に対応しやすくすることを考慮している。
+         * @constructor
+         * @param {number} index ターゲットタイプのインデックス
+         * @returns {string} 作成したajaxクエリ
+         */
+        function makeQuery(index)
+        {
+            let ret = "?";
+            let query = {};
+
+            query["<%= Setting.queryAndProperty.req.index %>"] = index;
+
+            //全要素を連結するループ
+            for (let key of Object.keys(query))
+            {
+                ret += key + "=" + query[key] + "&";
+            }
+
+            ret = ret.substr(0, ret.length - 1);
+            return ret;
+        }
+
+        /**
+            * ajaxのレスポンスを解析する。
+            * @constructor
+            * @param {object} ajaxRes ajaxのレスポンス
+            */
+        function analyzeRes(ajaxRes)
+        {
+            let res = JSON.parse(ajaxRes);
+            let ret = res["<%= Setting.queryAndProperty.res.result %>"];
+            DEBUGForValue('res["<%= Setting.queryAndProperty.res.result %>"]', res["<%= Setting.queryAndProperty.res.result %>"]);
+
+            //未読数取得
+            // let unread = Target[resIndex].unread;
+
+            if (ret != "<%= AppConst.ERROR %>")
+            {
+                tallyCore(res["<%= Setting.queryAndProperty.res.detail %>"]);
+            }
+
+            //タイトルにチェック状況表示
+            // setTitleByTargetIndex(resIndex);
+
+            return ret;
+        }
+
+        function tallyCore(params)
+        {
+            let apiRes = params;
+            apiRes = apiRes["<%= Setting.queryAndProperty.res.data %>"]
+            DEBUGForValue("apiRes.results.length", apiRes.results.length);
+            let tweets = apiRes.results;
+            var part = tweets.filter(
+                function (value, index, array)
+                {
+                    //新しいユーザーを除外
+                    // <-
+                    let dateUserCreated = new Date(value.user.created_at);
+
+                    if (DATENHKHASHTAG < dateUserCreated)
+                    {
+                        return false;
+                    }
+                    // ->
+
+                    //タグが無いものを除外
+                    //　<-
+                    if (value.text.indexOf("<%= Setting.nhkHasTag %>") == -1)
+                    {
+                        return false;
+                    }
+                    //　->
+
+                    return true;
+                });
+
+            let vote;
+
+            for (let index = 0; index < part.length; index++)
+            {
+                const element = part[index];
+
+                //投票済みのユーザーか
+                if (user.includes(element.user.id))
+                {
+                    continue;
+                }
+
+                //NHKタグの行を特定
+                //　<-
+                let lines = element.text.split("\n");
+                let indexNhkTag = -1;
+
+                for (let index2 = 0; index2 < lines.length; index2++)
+                {
+                    if (lines[index2].indexOf("<%= Setting.nhkHasTag %>") != -1)
+                    {
+                        indexNhkTag = index2;
+                        break;
+                    }
+                }
+
+                if (indexNhkTag == -1)
+                {
+                    fatal("analyzeRes");
+                }
+                //　->
+
+                //タグの前行に票が有るか
+                //　<-
+                let isExistBefore = true;
+
+                if (indexNhkTag == 0)
+                {
+                    isExistBefore = false;
+                }
+                else
+                {
+                    let str = "";
+
+                    for (let index2 = 0; index2 < indexNhkTag; index2++)
+                    {
+                        str += lines[index2];
+                    }
+
+                    if (str == "")
+                    {
+                        isExistBefore = false;
+                    }
+                }
+                //　->
+
+                //票は前行が優先
+                vote = [];
+
+                if (isExistBefore)
+                {
+                    for (let index2 = indexNhkTag - 1; (index2 >= 0) && (vote.length < 3); index2--)
+                    {
+                        if (lines[index2] == "")
+                        {
+                            continue;
+                        }
+
+                        let voteSingle = Treat(lines[index2]);
+                        vote.push(voteSingle);
+                    }
+                }
+                else
+                {
+                    if (indexNhkTag + 1 < lines.length)
+                    {
+                        for (let index2 = indexNhkTag + 1; (index2 < lines.length) && (vote.length < 3); index2++)
+                        {
+                            if (lines[index2] == "")
+                            {
+                                continue;
+                            }
+
+                            let voteSingle = Treat(lines[index2]);
+                            vote.push(voteSingle);
+                        }
+                    }
+                }
+
+                user.push(element.user.id);
+
+                //totallingに投票
+                for (const iterator of vote)
+                {
+                    let index2;
+
+                    for (index2 = 0; index2 < totalling.length; index2++)
+                    {
+                        if (totalling[index2].title == iterator)
+                        {
+                            totalling[index2].vote++;
+                            break;
+                        }
+                    }
+
+                    if (index2 == totalling.length)
+                    {
+                        totalling.push(
+                            {
+                                "vote": 1,
+                                "title": iterator
+                            });
+                    }
+                }
+            }
+        }
+
+        function Treat(params)
+        {
+            let ret;
+
+            ret = params.substr(0, 20);
+
+            //カテゴリーを無視
+            ret = ret.replace(REGEXPCATEGORY, "");
+
+            //記号を無視
+            ret = ret.replace(REGEXPSYMBOL, "");
+
+            return ret;
+        }
+
+        /**
+            * ajaxを呼び出す。
+            * 同期化している。
+            * @constructor
+            * @param {string} url ajaxのアクセス先
+            * @returns {Promise} インスタンス
+            */
+        async function syncAjax(url)
+        {
+            return new Promise(
+                /**
+                    * ajaxを呼び出す。
+                    * 同期化を考慮している。
+                    * (待たせる方)
+                    * @param resolve 成功コールバック
+                    * @param reject 失敗コールバック
+                    */
+                function (resolve, reject)
+                {
+                    $.ajax(
+                        {
+                            url: url,
+                            error:
+                                /**
+                                * ajaxのerrorコールバック
+                                * @param {jqXHR} jqXHR ajaxから引用
+                                * @param {string} textStatus ajaxから引用
+                                * @param {string} errorThrown ajaxから引用
+                                */
+                                function (jqXHR, textStatus, errorThrown)
+                                {
+                                    console.error("ERROR:" + url);
+                                    console.error(jqXHR);
+                                    console.error(textStatus);
+                                    console.error(errorThrown);
+                                },
+                            success:
+                                /**
+                                * ajaxのsuccessコールバック
+                                * @param {object} data ajaxから引用
+                                */
+                                function (data)
+                                {
+                                    DEBUGForMessage("ajax success");
+                                    resolve(data);
+                                }
+                        });
+                });
+        }
+
+        /**
+            * ajaxを呼び出す。
+            * 同期化している。
+            * @constructor
+            * @param {number} index ターゲットタイプのインデックス
+            */
+        async function callAjax(index)
+        {
+            //ajaxクエリ作成
+            let query = makeQuery(index);
+
+            let url = "<%= Setting.nodejs.urlBase %>" + ":" + "<%= Setting.nodejs.port %>" + "<%= Setting.nodejs.urlAjax %>";
+            url += query;
+            DEBUGForValue("url", url);
+            // $("#status").attr("value", (TargetType[index].type == "<%= AppConst.LIST %>" ? TargetType[index].index : TargetType[index].type) + " チェック中");
+
+            //同期ajax
+            let ret = await syncAjax(url);
+
+            // $("#status").attr("value", "未通信");
+
+            return ret;
+        }
+
+        /**
+            * ajaxを使用して解析を行う。
+            * @constructor
+            */
+        async function tally(index)
+        {
+            let ret;
+
+            //同期式でajaxを使って2次データ取得
+            let ajaxRes = await callAjax(index);
+
+            //ajaxのレスポンス解析
+            ret = analyzeRes(ajaxRes);
+
+            if (ret == "<%= AppConst.ERROR %>")
+            {
+                return ret;
+            }
+
+            totalling.sort(
+                function (a, b)
+                {
+                    if (a.vote > b.vote)
+                    {
+                        return 1;
+                    }
+
+                    if (a.vote < b.vote)
+                    {
+                        return -1;
+                    }
+
+                    return 0;
+                });
+
+            return ret;
+        }
+
+        /**
+            * 初期化
+            * @constructor
+            */
+        async function initialize()
+        {
+            Debug = "<%= Setting.debug %>";
+
+            // //区切りが入った未読数を表すタイトル作成
+            // let initTitle = makeInitTitle(<%= List.length %>, tmpNotificationsOrder.length);
+
+            // $("title").text(initTitle);
+
+            let initTable =
+                [
+                    { "票": "-", "タイトル": "-", }
+                ];
+
+            let index = 0;
+            let ret = "<%= AppConst.NEXT %>";
+
+            $('#columns').columns({
+                data: initTable,
+                size: 100,
+                sortBy: "vote",
+                reverse: true
+            });
+
+            //簡略データ取得ループ
+            while (ret == "<%= AppConst.NEXT %>")
+            {
+                ret = await tally(index);
+
+                if (ret == "<%= AppConst.ERROR %>")
+                {
+                    continue;
+                }
+
+                index++;
+                $('#columns').columns('destroy');
+                $('#columns').columns({
+                    data: totalling,
+                    size: 100,
+                    sortBy: "vote",
+                    reverse: true
+                });
+                //***
+                if (index == 6)
+                {
+                    // break;
+                }
+            }
+
+            // $("title").text($("title").text().replace(":", "-"));
+            return;
+        }
+    </script>
+</head>
+
+<body>
+    <style>
+        table {
+            border: 1px solid black;
+        }
+
+        td {
+            white-space: nowrap;
+            border: 1px solid black;
+        }
+
+        th {
+            white-space: nowrap;
+            border: 1px solid black;
+        }
+    </style>
+    <div id="columns"></div>
+    エラー詳細
+    <a href="https://developer.twitter.com/en/docs/basics/response-codes"
+        target="error">https://developer.twitter.com/en/docs/basics/response-codes</a>
+    <script>
+        //初期化
+        setTimeout(initialize, 0);
+    </script>
+</body>
+
+</html>
